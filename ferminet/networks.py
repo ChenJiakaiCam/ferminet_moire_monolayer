@@ -296,6 +296,7 @@ class BaseNetworkOptions:
       )
   )
   jastrow: jastrows.JastrowType = jastrows.JastrowType.NONE
+  jastrow_kwargs: Optional[Mapping[str, Any]] = None
   complex_output: bool = False
 
 
@@ -1088,7 +1089,7 @@ def make_orbitals(
 
   # Optional Jastrow factor.
   jastrow_init, jastrow_apply = jastrows.get_jastrow(
-      options.jastrow, options.lattice, options.ndim
+      options.jastrow, options.lattice, options.ndim, options.jastrow_kwargs
   )
 
   def init(key: chex.PRNGKey) -> ParamTree:
@@ -1381,6 +1382,7 @@ def make_fermi_net(
     envelope: Optional[envelopes.Envelope] = None,
     feature_layer: Optional[FeatureLayer] = None,
     jastrow: Union[str, jastrows.JastrowType] = jastrows.JastrowType.NONE,
+    jastrow_kwargs: Optional[Mapping[str, Any]] = None,
     complex_output: bool = False,
     bias_orbitals: bool = False,
     full_det: bool = True,
@@ -1468,6 +1470,7 @@ def make_fermi_net(
       envelope=envelope,
       feature_layer=feature_layer,
       jastrow=jastrow,
+      jastrow_kwargs=jastrow_kwargs,
       complex_output=complex_output,
       bias_orbitals=bias_orbitals,
       full_det=full_det,

@@ -66,8 +66,10 @@ def init_electrons(  # pylint: disable=dangerous-default-value
     init_width: float,
     core_electrons: Mapping[str, int] = {},
     max_iter: int = 10_000,
+    ndim: int = 3,
+    lattice: Optional[jnp.ndarray] = None,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-  """Initializes electron positions around each atom.
+  """Initializes electron positions around each atom or uniformly in a PBC cell.
 
   Args:
     key: JAX RNG state.
@@ -82,6 +84,11 @@ def init_electrons(  # pylint: disable=dangerous-default-value
     max_iter: maximum number of iterations to try to find a valid initial
         electron configuration for each atom. If reached, all electrons are
         initialised from a Gaussian distribution centred on the origin.
+    ndim: dimensionality of the space.
+    lattice: optional (ndim, ndim) periodic cell matrix (columns are cell
+      vectors). If provided and the molecule has zero total nuclear charge
+      (e.g., a ghost atom in HEG or 2D moire systems), walkers are initialized
+      uniformly in fractional cell coordinates.
 
   Returns:
     array of (batch_size, (nalpha+nbeta)*ndim) of initial (random) electron
@@ -90,9 +97,25 @@ def init_electrons(  # pylint: disable=dangerous-default-value
     of spin configurations, where 1 and -1 indicate alpha and beta electrons
     respectively.
   """
-  niter = 0
   total_electrons = sum(atom.charge - core_electrons.get(atom.symbol, 0)
                         for atom in molecule)
+  if lattice is not None and total_electrons == 0:
+    lat = jnp.asarray(lattice)
+    cell_ndim = lat.shape[0]
+    nelectrons = sum(electrons)
+    key, subkey = jax.random.split(key)
+    fractional = jax.random.uniform(
+        subkey, shape=(batch_size, nelectrons, cell_ndim)
+    )
+    electron_positions = jnp.reshape(
+        fractional @ lat.T, (batch_size, nelectrons * cell_ndim)
+    )
+    electron_spins = _assign_spin_configuration(
+        electrons[0], electrons[1], batch_size=batch_size
+    )
+    return electron_positions, electron_spins
+
+  niter = 0
   if total_electrons != sum(electrons):
     if len(molecule) == 1:
       atomic_spin_configs = [electrons]
@@ -133,7 +156,7 @@ def init_electrons(  # pylint: disable=dangerous-default-value
         ' implementing a custom initialisation.',
         niter,
     )
-    electron_positions = jnp.zeros(shape=(3*sum(electrons),))
+    electron_positions = jnp.zeros(shape=(ndim * sum(electrons),))
 
   # Create a batch of configurations with a Gaussian distribution about each
   # atom.
@@ -480,10 +503,12 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
         hartree_fock.mean_field.mo_coeff
     )
 
-  if cfg.system.lattice is not None:
-    cfg.network.make_feature_layer_kwargs.setdefault(
-        'lattice', cfg.system.lattice
-    )
+  if (
+      cfg.system.lattice is not None
+      and 'lattice' not in cfg.network.make_feature_layer_kwargs
+  ):
+    with cfg.ignore_type():
+      cfg.network.make_feature_layer_kwargs['lattice'] = cfg.system.lattice
   if cfg.network.make_feature_layer_fn:
     feature_layer_module, feature_layer_fn = (
         cfg.network.make_feature_layer_fn.rsplit('.', maxsplit=1))
@@ -529,6 +554,7 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
         envelope=envelope,
         feature_layer=feature_layer,
         jastrow=cfg.network.get('jastrow', 'default'),
+        jastrow_kwargs=cfg.network.get('jastrow_kwargs', None),
         bias_orbitals=cfg.network.bias_orbitals,
         full_det=cfg.network.full_det,
         rescale_inputs=cfg.network.get('rescale_inputs', False),
@@ -546,6 +572,7 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
         envelope=envelope,
         feature_layer=feature_layer,
         jastrow=cfg.network.get('jastrow', 'default'),
+        jastrow_kwargs=cfg.network.get('jastrow_kwargs', None),
         bias_orbitals=cfg.network.bias_orbitals,
         rescale_inputs=cfg.network.get('rescale_inputs', False),
         complex_output=use_complex,
@@ -639,6 +666,8 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
         batch_size=total_host_batch_size,
         init_width=cfg.mcmc.init_width,
         core_electrons=core_electrons,
+        ndim=cfg.system.ndim,
+        lattice=cfg.system.lattice,
     )
 
     # If PBC, map electrons back to the simulation cell
@@ -768,10 +797,12 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
   )
 
   # Construct loss and optimizer
-  if cfg.system.lattice is not None:
-    cfg.system.make_local_energy_kwargs.setdefault(
-        'lattice', cfg.system.lattice
-    )
+  if (
+      cfg.system.lattice is not None
+      and 'lattice' not in cfg.system.make_local_energy_kwargs
+  ):
+    with cfg.ignore_type():
+      cfg.system.make_local_energy_kwargs['lattice'] = cfg.system.lattice
   if cfg.system.make_local_energy_fn:
     local_energy_module, local_energy_fn = (
         cfg.system.make_local_energy_fn.rsplit('.', maxsplit=1))

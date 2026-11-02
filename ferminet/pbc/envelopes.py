@@ -28,6 +28,28 @@ import jax.numpy as jnp
 import numpy as np
 
 
+def migrate_multiwave_envelope_params(
+    envelope_params: Sequence[Mapping[str, jnp.ndarray]],
+) -> Tuple[Sequence[Mapping[str, jnp.ndarray]], bool]:
+  migrated = []
+  changed = False
+  for block in envelope_params:
+    if (
+        isinstance(block, Mapping)
+        and 'linear_sigma' not in block
+        and 'sigma' in block
+    ):
+      new_block = dict(block)
+      new_block['linear_sigma'] = new_block.pop('sigma') ** 2.0
+      migrated.append(new_block)
+      changed = True
+    else:
+      migrated.append(block)
+  if isinstance(envelope_params, tuple):
+    return tuple(migrated), changed
+  return migrated, changed
+
+
 def make_multiwave_envelope(kpoints: jnp.ndarray) -> envelopes.Envelope:
   """Returns an oscillatory envelope.
 
@@ -58,18 +80,26 @@ def make_multiwave_envelope(kpoints: jnp.ndarray) -> envelopes.Envelope:
     params = []
     nk = kpoints.shape[0]
     for output_dim in output_dims:
-      params.append({'sigma': jnp.zeros((2 * nk, output_dim))})
-      params[-1]['sigma'] = params[-1]['sigma'].at[0, :].set(1.0)
+      params.append({'linear_sigma': jnp.zeros((2 * nk, output_dim))})
+      params[-1]['linear_sigma'] = params[-1]['linear_sigma'].at[0, :].set(1.0)
     return params
 
   def apply(*, ae: jnp.ndarray, r_ae: jnp.ndarray, r_ee: jnp.ndarray,
             **kwargs: jnp.ndarray) -> jnp.ndarray:
     """See ferminet.envelopes.EnvelopeApply."""
     del r_ae, r_ee  # unused
+    if 'linear_sigma' not in kwargs:
+      if 'sigma' in kwargs:
+        raise ValueError(
+            "Found legacy multiwave envelope parameter 'sigma' instead of "
+            "'linear_sigma'. Migrate checkpoint parameters with "
+            'ferminet.pbc.envelopes.migrate_multiwave_envelope_params.'
+        )
+      raise KeyError("Missing envelope parameter 'linear_sigma'.")
     phase_coords = ae @ kpoints.T
     waves = jnp.concatenate((jnp.cos(phase_coords), jnp.sin(phase_coords)),
                             axis=2)
-    env = waves @ (kwargs['sigma'] ** 2.0)
+    env = waves @ kwargs['linear_sigma']
     return jnp.sum(env, axis=1)
 
   return envelopes.Envelope(envelopes.EnvelopeType.PRE_DETERMINANT, init, apply)
@@ -116,7 +146,7 @@ def make_kpoints(
   ordinals = sorted(range(-max_k, max_k+1), key=abs)
   ordinals = jnp.asarray(list(itertools.product(ordinals, repeat=ndim)))
 
-  kpoints = ordinals @ rec_lattice.T
+  kpoints = ordinals @ rec_lattice
   kpoints = jnp.asarray(sorted(kpoints, key=jnp.linalg.norm))
   k_norms = jnp.linalg.norm(kpoints, axis=1)
 
