@@ -35,12 +35,17 @@ def periodic_norm(metric: jnp.ndarray, scaled_r: jnp.ndarray) -> jnp.ndarray:
     scaled_r: vectors in fractional coordinates of the lattice cell, with
       trailing dimension ndim, to compute the periodic norm of.
   """
+  return jnp.sqrt(periodic_norm_sq(metric, scaled_r))
+
+
+def periodic_norm_sq(metric: jnp.ndarray, scaled_r: jnp.ndarray) -> jnp.ndarray:
+  """Returns the squared periodic norm of a set of vectors without sqrt."""
   chex.assert_rank(metric, expected_ranks=2)
   a = (1 - jnp.cos(2 * jnp.pi * scaled_r))
   b = jnp.sin(2 * jnp.pi * scaled_r)
   cos_term = jnp.einsum('...m,mn,...n->...', a, metric, a)
   sin_term = jnp.einsum('...m,mn,...n->...', b, metric, b)
-  return (1 / (2 * jnp.pi)) * jnp.sqrt(cos_term + sin_term)
+  return (1 / (2 * jnp.pi) ** 2) * (cos_term + sin_term)
 
 
 def make_pbc_feature_layer(
@@ -50,6 +55,7 @@ def make_pbc_feature_layer(
     rescale_inputs: bool = False,
     lattice: Optional[jnp.ndarray] = None,
     include_r_ae: bool = True,
+    moire_lattice: Optional[jnp.ndarray] = None,
     **kwargs: Any,
 ) -> networks.FeatureLayer:
   """Returns the init and apply functions for periodic features.
@@ -66,6 +72,10 @@ def make_pbc_feature_layer(
         to avoid cusps with ghost atoms in, e.g., homogeneous electron gas. If
         not needed, set cfg.network.make_feature_layer_kwargs['include_r_ae'] =
         False
+      moire_lattice: Optional primitive moire unit-cell matrix whose columns are
+        the primitive moire lattice vectors, shape (ndim, ndim). When provided,
+        appends primitive moire periodic phase features
+        (sin(2*pi*s_moire), cos(2*pi*s_moire)) to the one-electron stream.
       **kwargs: Unused additional keyword arguments.
   """
 
@@ -77,12 +87,17 @@ def make_pbc_feature_layer(
   # Calculate reciprocal vectors, factor 2pi omitted
   reciprocal_vecs = jnp.linalg.inv(lattice)
   lattice_metric = lattice.T @ lattice
+  moire_reciprocal_vecs = (
+      jnp.linalg.inv(moire_lattice) if moire_lattice is not None else None
+  )
 
   def init() -> Tuple[Tuple[int, int], networks.Param]:
+    one_e_per_atom = 2 * ndim
+    if moire_reciprocal_vecs is not None:
+      one_e_per_atom += 2 * ndim
     if include_r_ae:
-      return (natoms * (2 * ndim + 1), 2 * ndim + 1), {}
-    else:
-      return (natoms * (2 * ndim), 2 * ndim + 1), {}
+      one_e_per_atom += 1
+    return (natoms * one_e_per_atom, 2 * ndim + 1), {}
 
   def apply(
       ae, r_ae, ee, r_ee, **params: jnp.ndarray
@@ -93,18 +108,29 @@ def make_pbc_feature_layer(
     # Two e features in phase coordinates
     s_ee = jnp.einsum('il,jkl->jki', reciprocal_vecs, ee)
     # Periodized features
-    ae = jnp.concatenate(
-        (jnp.sin(2 * jnp.pi * s_ae), jnp.cos(2 * jnp.pi * s_ae)), axis=-1)
+    ae_periodic = jnp.concatenate(
+        (jnp.sin(2 * jnp.pi * s_ae), jnp.cos(2 * jnp.pi * s_ae)), axis=-1
+    )
+    if moire_reciprocal_vecs is not None:
+      s_moire = jnp.einsum('il,jkl->jki', moire_reciprocal_vecs, ae)
+      moire_periodic = jnp.concatenate(
+          (jnp.sin(2 * jnp.pi * s_moire), jnp.cos(2 * jnp.pi * s_moire)),
+          axis=-1,
+      )
+      ae = jnp.concatenate((ae_periodic, moire_periodic), axis=-1)
+    else:
+      ae = ae_periodic
     ee = jnp.concatenate(
         (jnp.sin(2 * jnp.pi * s_ee), jnp.cos(2 * jnp.pi * s_ee)), axis=-1)
     # Distance features defined on orthonormal projections
     r_ae = periodic_norm(lattice_metric, s_ae)
     if rescale_inputs:
       r_ae = jnp.log(1 + r_ae)
-    # Don't take gradients through |0|
+    # Don't take gradients through |0|; avoid shifting s_ee by 1 period.
     n = ee.shape[0]
-    s_ee += jnp.eye(n)[..., None]
-    r_ee = periodic_norm(lattice_metric, s_ee) * (1.0 - jnp.eye(n))
+    r_ee_sq = periodic_norm_sq(lattice_metric, s_ee)
+    eye = jnp.eye(n, dtype=r_ee_sq.dtype)
+    r_ee = jnp.sqrt(r_ee_sq + eye) * (1.0 - eye)
 
     if include_r_ae:
       ae_features = jnp.concatenate((r_ae[..., None], ae), axis=2)
